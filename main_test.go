@@ -5,8 +5,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,5 +156,59 @@ func TestProxy(t *testing.T) {
 	}
 	if names, _ := instances(); len(names) != 1 {
 		t.Errorf("after delete: %v", names)
+	}
+}
+
+func TestUI(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SERVER_SWITCHER_CONFIG_DIR", dir)
+	if err := saveConfig(filepath.Join(dir, "hoge.json"), &Config{Default: "a", Backends: map[string]string{"a": "127.0.0.1:1", "b": "127.0.0.1:2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(filepath.Join(dir, "foo.json"), &Config{Cookie: "X-Foo", Default: "x", Backends: map[string]string{"x": "127.0.0.1:3"}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(uiHandler(""))
+	t.Cleanup(srv.Close)
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	post := func(v url.Values) *http.Response {
+		t.Helper()
+		res, err := noRedirect.PostForm(srv.URL, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res
+	}
+
+	// 切り替え: instance ごとの cookie 名でセットされる
+	res := post(url.Values{"instance": {"hoge"}, "backend": {"b"}})
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+	if cs := res.Cookies(); len(cs) != 1 || cs[0].Name != "X-Backend" || cs[0].Value != "b" || cs[0].Path != "/" {
+		t.Fatalf("cookies = %v", cs)
+	}
+	if cs := post(url.Values{"instance": {"foo"}, "backend": {"x"}}).Cookies(); len(cs) != 1 || cs[0].Name != "X-Foo" {
+		t.Fatalf("foo cookies = %v", cs)
+	}
+
+	// 表示: 全 instance と現在値が出る
+	code, body := getWithCookie(t, srv.URL, "", "X-Backend=b")
+	if code != 200 || !strings.Contains(body, `id="hoge"`) || !strings.Contains(body, `id="foo"`) || !strings.Contains(body, "<b>b</b>") {
+		t.Errorf("GET: %d %s", code, body)
+	}
+
+	// 未登録の backend / instance は拒否
+	if res := post(url.Values{"instance": {"hoge"}, "backend": {"zzz"}}); res.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown backend status = %d", res.StatusCode)
+	}
+	if res := post(url.Values{"instance": {"nope"}, "backend": {"a"}}); res.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown instance status = %d", res.StatusCode)
+	}
+
+	// 削除: MaxAge<0 で消える
+	if cs := post(url.Values{"instance": {"hoge"}, "backend": {""}}).Cookies(); len(cs) != 1 || cs[0].MaxAge >= 0 {
+		t.Errorf("clear cookies = %v", cs)
 	}
 }

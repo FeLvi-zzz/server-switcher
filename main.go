@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"log"
 	"net"
 	"net/http"
@@ -29,6 +30,11 @@ Commands:
                                     instance の設定に保存され、次回以降は省略可
                                     (未設定時: 127.0.0.1:8080, X-Backend, X-Backend)
                                     接続先の選択は header > cookie > default の優先順
+  ui [-listen ADDR] [-domain DOMAIN]
+                                    全 instance の routing cookie をセットして接続先を切り替える画面を出す
+                                    簡易サーバーを起動 (default: 127.0.0.1:8090)。
+                                    cookie は port を区別しないため、proxy と同じ host で開けば proxy にも効く。
+                                    -domain を指定すると cookie の Domain 属性に使う (例: example.test でサブドメイン共有)
   add <instance> <name> <target>    接続先を登録 (target: unix:/path/to.sock | host:port | http://host:port)
   rm <instance> <name>              接続先を解除
   default <instance> <name>         default 接続先を切り替え
@@ -39,9 +45,10 @@ Config: $SERVER_SWITCHER_CONFIG_DIR/<instance>.json (default dir: ~/.config/serv
 `
 
 const (
-	defaultListen = "127.0.0.1:8080"
-	defaultHeader = "X-Backend"
-	defaultCookie = "X-Backend"
+	defaultListen   = "127.0.0.1:8080"
+	defaultHeader   = "X-Backend"
+	defaultCookie   = "X-Backend"
+	defaultUIListen = "127.0.0.1:8090"
 )
 
 type Config struct {
@@ -338,6 +345,172 @@ func stripCookie(req *http.Request, name string) {
 	}
 }
 
+// ---- cookie switcher UI ----
+
+var uiTmpl = template.Must(template.New("ui").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>server-switcher</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:48em;margin:2em auto;padding:0 1em}
+table{border-collapse:collapse;width:100%}
+td{padding:.4em .6em;border-bottom:1px solid #ddd}
+tr.active{background:#e6f4ea;font-weight:bold}
+code{color:#555}
+.err{color:#c00}
+h2 small{font-weight:normal;color:#555}
+</style></head><body>
+<h1>server-switcher</h1>
+{{range .Instances}}<section id="{{.Name}}">
+<h2>{{.Name}} <small>{{.Listen}}{{if .Running}} (running){{else}} (stopped){{end}}</small></h2>
+{{if .Error}}<p class="err">{{.Error}}</p>{{else}}
+<p>cookie <code>{{.Cookie}}</code> = {{if .Current}}<b>{{.Current}}</b>{{else}}(未設定: default の {{if .Default}}<b>{{.Default}}</b>{{else}}<span class="err">未設定</span>{{end}} を使用){{end}}
+{{if .Unknown}}<span class="err">(この instance には未登録の接続先です)</span>{{end}}</p>
+{{if .SharedWith}}<p class="err">cookie 名が {{range $i, $n := .SharedWith}}{{if $i}}, {{end}}{{$n}}{{end}} と共通のため、切り替えるとそちらにも効きます（別名にするには <code>serve {{.Name}} -cookie NAME</code>）</p>{{end}}
+<form method="post">
+<input type="hidden" name="instance" value="{{.Name}}">
+<table>
+{{range .Backends}}<tr{{if .Active}} class="active"{{end}}>
+<td>{{.Name}}{{if .IsDefault}} <small>(default)</small>{{end}}</td>
+<td><code>{{.Target}}</code></td>
+<td><button name="backend" value="{{.Name}}"{{if .Active}} disabled{{end}}>切り替え</button></td>
+</tr>{{else}}<tr><td>(接続先が登録されていません)</td></tr>{{end}}
+</table>
+<p><button name="backend" value=""{{if not .Current}} disabled{{end}}>cookie を削除 (default に戻す)</button></p>
+</form>{{end}}
+</section>{{else}}<p>(no instances)</p>{{end}}
+</body></html>
+`))
+
+type uiBackend struct {
+	Name, Target      string
+	Active, IsDefault bool
+}
+
+type uiInstance struct {
+	Name, Listen, Cookie, Current, Default, Error string
+	Running, Unknown                              bool
+	SharedWith                                    []string
+	Backends                                      []uiBackend
+}
+
+func buildUIInstance(r *http.Request, name string, cfg *Config) uiInstance {
+	in := uiInstance{Name: name, Listen: cfg.listen(), Cookie: cfg.cookie(), Default: cfg.Default, Running: running(cfg.listen())}
+	if c, err := r.Cookie(in.Cookie); err == nil {
+		in.Current = c.Value
+		_, ok := cfg.Backends[c.Value]
+		in.Unknown = !ok
+	}
+	effective := in.Current
+	if effective == "" {
+		effective = cfg.Default
+	}
+	names := make([]string, 0, len(cfg.Backends))
+	for n := range cfg.Backends {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		in.Backends = append(in.Backends, uiBackend{
+			Name: n, Target: cfg.Backends[n], Active: n == effective, IsDefault: n == cfg.Default,
+		})
+	}
+	return in
+}
+
+// uiHandler は全 instance の routing cookie を付け外しする画面を返す。
+// cookie は port を区別しないので、同じ host で proxy にアクセスすればそのまま効く。
+func uiHandler(domain string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+		case http.MethodPost:
+			instance, b := r.PostFormValue("instance"), r.PostFormValue("backend")
+			path, err := configPath(instance)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if _, err := os.Stat(path); err != nil {
+				http.Error(w, fmt.Sprintf("unknown instance %q", instance), http.StatusBadRequest)
+				return
+			}
+			cfg, err := loadConfig(path)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			c := &http.Cookie{Name: cfg.cookie(), Path: "/", Domain: domain, SameSite: http.SameSiteLaxMode}
+			if b == "" {
+				c.MaxAge = -1
+			} else {
+				if _, ok := cfg.Backends[b]; !ok {
+					http.Error(w, fmt.Sprintf("unknown backend %q in instance %q", b, instance), http.StatusBadRequest)
+					return
+				}
+				c.Value = b
+				c.MaxAge = 365 * 24 * 60 * 60
+			}
+			http.SetCookie(w, c)
+			log.Printf("%s: cookie %s=%q", instance, c.Name, b)
+			http.Redirect(w, r, "/#"+instance, http.StatusSeeOther)
+			return
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		names, err := instances()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var page struct{ Instances []uiInstance }
+		byCookie := map[string][]string{}
+		for _, n := range names {
+			path, _ := configPath(n)
+			cfg, err := loadConfig(path)
+			if err != nil {
+				page.Instances = append(page.Instances, uiInstance{Name: n, Error: err.Error()})
+				continue
+			}
+			in := buildUIInstance(r, n, cfg)
+			byCookie[in.Cookie] = append(byCookie[in.Cookie], n)
+			page.Instances = append(page.Instances, in)
+		}
+		for i := range page.Instances {
+			in := &page.Instances[i]
+			for _, n := range byCookie[in.Cookie] {
+				if n != in.Name && in.Error == "" {
+					in.SharedWith = append(in.SharedWith, n)
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := uiTmpl.Execute(w, page); err != nil {
+			log.Printf("render: %v", err)
+		}
+	})
+}
+
+func cmdUI(args []string) error {
+	fs := flag.NewFlagSet("ui", flag.ExitOnError)
+	listen := fs.String("listen", defaultUIListen, "listen address (host:port)")
+	domain := fs.String("domain", "", "Domain attribute of the cookie (default: host only)")
+	fs.Parse(args)
+
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("%w (change it with `ui -listen ADDR`)", err)
+	}
+	log.SetPrefix("[ui] ")
+	log.Printf("open http://%s/ (config dir: %s)", *listen, configDir())
+	return http.Serve(ln, uiHandler(*domain))
+}
+
 // ---- commands ----
 
 func cmdServe(instance string, args []string) error {
@@ -486,6 +659,8 @@ func run(args []string) error {
 			return fmt.Errorf("serve: instance name required\n\n%s", usage)
 		}
 		return cmdServe(rest[0], rest[1:])
+	case "ui":
+		return cmdUI(rest)
 	case "add":
 		if err := need(3); err != nil {
 			return err
