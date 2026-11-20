@@ -53,3 +53,7 @@ server-switcher delete foo    # instance ごと削除
 - 画面は毎回設定ファイルを読むので、`add` / `rm` / `default` の変更は再読み込みで反映される
 
 設定ファイル: `$SERVER_SWITCHER_CONFIG_DIR/<instance>.json`（未指定時は `~/.config/server-switcher/`）
+
+## License
+
+[MIT](LICENSE)
